@@ -131,7 +131,7 @@ def has_overlap(trees: List[ChristmasTree]) -> bool:
         for j in range(i + 1, n):
             p_i = polys[i]
             p_j = polys[j]
-            if p_i.intersects(p_j) and not touches(p_i, p_j):
+            if p_i.intersects(p_j) and not p_i.touches(p_j):
                 return True
     return False
 
@@ -173,7 +173,7 @@ def bounding_square_side(
 
 def layout_cost(
     trees: List[ChristmasTree],
-    overlap_penalty: Decimal | float = Decimal("1e6"),
+    overlap_penalty: Decimal | float = Decimal("1e3"),  # smaller than 1e6
     center_bounds: Tuple[float, float] = CENTER_BOUNDS,
 ) -> float:
     """

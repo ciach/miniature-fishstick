@@ -4,10 +4,13 @@ import math
 import random
 from copy import deepcopy
 from decimal import Decimal
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 from shapely.ops import unary_union
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from geometry import (
     ChristmasTree,
@@ -34,8 +37,10 @@ STEP_ANGLE = 10.0
 T_START = 1.0
 T_END = 1e-3
 
-# Kaggle-like index for submission
-INDEX = [f"{n:03d}_{t}" for n in range(1, MAX_N + 1) for t in range(n)]
+CENTER_MIN = Decimal("-100")
+CENTER_MAX = Decimal("100")
+
+console = Console()
 
 
 # ----------------------------------------------------------------------
@@ -123,6 +128,9 @@ def greedy_initialize_single_n(num_trees: int):
 def compact_layout(trees):
     """
     Simple compaction: shift all trees so the bounding box moves near (0, 0).
+
+    This does NOT shrink the square like a true compactor, but avoids them
+    drifting too far away.
     """
     if not trees:
         return
@@ -182,7 +190,21 @@ def simulated_annealing_for_n(n: int):
         tree.angle = tree.angle + Decimal(str(dtheta))
         tree.update_polygon()
 
-        # Occasionally re-anchor layout
+        # Hard constraints: centers must stay in [-100, 100]
+        if (
+            tree.center_x < CENTER_MIN
+            or tree.center_x > CENTER_MAX
+            or tree.center_y < CENTER_MIN
+            or tree.center_y > CENTER_MAX
+        ):
+            # reject immediately
+            tree.center_x = old_cx
+            tree.center_y = old_cy
+            tree.angle = old_angle
+            tree.update_polygon()
+            continue
+
+        # Occasionally re-anchor layout (cheap compaction)
         if step % 200 == 0:
             compact_layout(current)
 
@@ -204,17 +226,18 @@ def simulated_annealing_for_n(n: int):
                 best_cost = new_cost
                 best = deepcopy(current)
         else:
-            # revert
+            # revert to old state
             tree.center_x = old_cx
             tree.center_y = old_cy
             tree.angle = old_angle
             tree.update_polygon()
 
-        if (step + 1) % 1000 == 0 or step == max_iter - 1:
-            print(
-                f"n={n:3d}, step={step+1}/{max_iter}, "
-                f"T={T:.4g}, current={current_cost:.6f}, best={best_cost:.6f}"
-            )
+        # You can keep or remove this inner print; in parallel it will be noisy.
+        # if (step + 1) % 1000 == 0 or step == max_iter - 1:
+        #     print(
+        #         f"n={n:3d}, step={step+1}/{max_iter}, "
+        #         f"T={T:.4g}, current={current_cost:.6f}, best={best_cost:.6f}"
+        #     )
 
     return best, best_cost
 
@@ -268,7 +291,7 @@ def write_submission(layouts, path: str = "submission_sa.csv"):
         df[col] = "s" + df[col].astype("string")
 
     df.to_csv(path)
-    print(f"Saved SA submission to {path}")
+    console.print(f"[green]Saved SA submission to [bold]{path}[/bold][/green]")
 
 
 # ----------------------------------------------------------------------
@@ -279,21 +302,61 @@ def write_submission(layouts, path: str = "submission_sa.csv"):
 def main():
     ns = list(range(1, MAX_N + 1))
 
-    layouts = {}
+    layouts: dict[int, list[tuple[str, str, str]]] = {}
     total_cost = 0.0
 
-    # Use all cores by default; tune max_workers if needed
-    with ProcessPoolExecutor() as ex:
-        futures = {ex.submit(sa_worker, n): n for n in ns}
+    console.print(
+        "[bold cyan]Starting SA optimization with multiprocessing...[/bold cyan]"
+    )
 
-        for fut in as_completed(futures):
-            n, layout, best_cost = fut.result()
-            layouts[n] = layout
-            total_cost += best_cost
-            print(f"Finished n={n:3d}, best_cost={best_cost:.6f}")
+    executor = ProcessPoolExecutor()  # no context manager, we control shutdown
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("•"),
+            TextColumn("{task.completed}/{task.total} n"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Optimizing", total=len(ns))
 
-    print(f"\nApprox total SA score (sum s^2/n): {total_cost:.6f}")
-    write_submission(layouts, "submission_sa.csv")
+            futures = {executor.submit(sa_worker, n): n for n in ns}
+
+            for fut in as_completed(futures):
+                n = futures[fut]
+                try:
+                    n_ret, layout, best_cost = fut.result()
+                except Exception as e:
+                    console.print(f"[red]Worker for n={n} failed: {e}[/red]")
+                    progress.update(task, advance=1)
+                    continue
+
+                layouts[n_ret] = layout
+                total_cost += best_cost
+
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"Optimizing (last finished n={n_ret})",
+                )
+                console.log(f"Finished n={n_ret:3d}, best_cost={best_cost:.6f}")
+
+    except KeyboardInterrupt:
+        console.print(
+            "\n[yellow]Ctrl+C detected. Cancelling all workers and shutting down...[/yellow]"
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise SystemExit(1)
+    else:
+        # Normal completion
+        executor.shutdown(wait=True)
+        console.print(
+            f"\n[bold green]Approx total SA score (sum s²/n over n=1..{MAX_N}): "
+            f"{total_cost:.6f}[/bold green]"
+        )
+        write_submission(layouts, "submission_sa.csv")
 
 
 if __name__ == "__main__":
