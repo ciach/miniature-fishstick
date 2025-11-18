@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import json
 import math
 import random
-from copy import deepcopy
-from decimal import Decimal
-from statistics import median
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from statistics import median
 
 import pandas as pd
 from shapely.ops import unary_union
@@ -25,10 +28,6 @@ from geometry import (
 
 MAX_N = 200
 RNG_SEED = 42
-
-# SA hyperparams
-SA_ITER_SMALL = 1_000  # for small n
-SA_ITER_LARGE = 5_000  # for large n
 N_THRESHOLD_LARGE = 80
 
 STEP_XY = 0.3
@@ -40,11 +39,132 @@ T_END = 1e-3
 CENTER_MIN = Decimal("-100")
 CENTER_MAX = Decimal("100")
 
-# Multi-start
-GOOD_THRESHOLD = 10.0  # if first run is better than this, skip extra restarts
-MAX_RESTARTS = 3  # total runs per n (first + up to 2 more)
+HEAVY_RERUN_THRESHOLD = 10.0
+RESULTS_PATH = Path("sa_partial_results.json")
+
+
+@dataclass(frozen=True)
+class SASettings:
+    label: str
+    iter_small: int
+    iter_large: int
+    max_restarts: int
+    good_threshold: float
+    seed_offset: int = 0
+
+
+LIGHT_SETTINGS = SASettings(
+    label="light",
+    iter_small=200,
+    iter_large=600,
+    max_restarts=1,
+    good_threshold=10.0,
+    seed_offset=0,
+)
+
+HEAVY_SETTINGS = SASettings(
+    label="heavy",
+    iter_small=500,
+    iter_large=2000,
+    max_restarts=2,
+    good_threshold=5.0,
+    seed_offset=1_000_000,
+)
 
 console = Console()
+
+
+def load_partial_results() -> dict[int, dict]:
+    if not RESULTS_PATH.exists():
+        return {}
+
+    data = json.loads(RESULTS_PATH.read_text())
+    results: dict[int, dict] = {}
+    for key, entry in data.items():
+        try:
+            n = int(key)
+        except ValueError:
+            continue
+
+        layout_raw = entry.get("layout", [])
+        layout = [tuple(item) for item in layout_raw]
+        best_cost = float(entry.get("best_cost", float("inf")))
+        best_settings = entry.get("best_settings", entry.get("settings", "unknown"))
+        heavy_attempted = bool(
+            entry.get(
+                "heavy_attempted",
+                best_settings == HEAVY_SETTINGS.label,
+            )
+        )
+
+        results[n] = {
+            "layout": layout,
+            "best_cost": best_cost,
+            "best_settings": best_settings,
+            "heavy_attempted": heavy_attempted,
+        }
+
+    return results
+
+
+def persist_partial_results(results: dict[int, dict]) -> None:
+    serializable: dict[str, dict] = {}
+    for n, entry in sorted(results.items()):
+        layout_serializable = [list(triple) for triple in entry["layout"]]
+        serializable[str(n)] = {
+            "layout": layout_serializable,
+            "best_cost": entry["best_cost"],
+            "best_settings": entry.get("best_settings", "unknown"),
+            "heavy_attempted": entry.get("heavy_attempted", False),
+        }
+
+    RESULTS_PATH.write_text(json.dumps(serializable, indent=2))
+
+
+def record_result(
+    n: int,
+    layout: list[tuple[str, str, str]],
+    best_cost: float,
+    settings: SASettings,
+    results: dict[int, dict],
+) -> None:
+    existing = results.get(n)
+    improved = existing is None or best_cost < existing["best_cost"]
+
+    heavy_attempted = (
+        existing.get("heavy_attempted", False) if existing else False
+    ) or (settings.label == HEAVY_SETTINGS.label)
+
+    if improved or existing is None:
+        new_entry = {
+            "layout": [tuple(triple) for triple in layout],
+            "best_cost": best_cost,
+            "best_settings": settings.label,
+            "heavy_attempted": heavy_attempted,
+        }
+    else:
+        new_entry = {
+            "layout": existing["layout"],
+            "best_cost": existing["best_cost"],
+            "best_settings": existing.get("best_settings", settings.label),
+            "heavy_attempted": heavy_attempted,
+        }
+
+    results[n] = new_entry
+    persist_partial_results(results)
+
+
+def needs_light_run(n: int, results: dict[int, dict]) -> bool:
+    return n not in results
+
+
+def needs_heavy_run(n: int, results: dict[int, dict]) -> bool:
+    entry = results.get(n)
+    if entry is None:
+        return True
+    return entry["best_cost"] > HEAVY_RERUN_THRESHOLD and not entry.get(
+        "heavy_attempted", False
+    )
 
 
 # ----------------------------------------------------------------------
@@ -153,9 +273,9 @@ def compact_layout(trees):
         t.update_polygon()
 
 
-def simulated_annealing_for_n(n: int):
+def simulated_annealing_for_n(n: int, settings: SASettings):
     """
-    Run SA for a specific puzzle size n.
+    Run SA for a specific puzzle size n using the provided settings.
 
     Returns:
         best_trees: list[ChristmasTree]
@@ -169,7 +289,8 @@ def simulated_annealing_for_n(n: int):
     best = deepcopy(current)
     best_cost = current_cost
 
-    max_iter = SA_ITER_SMALL if n < N_THRESHOLD_LARGE else SA_ITER_LARGE
+    max_iter = settings.iter_small if n < N_THRESHOLD_LARGE else settings.iter_large
+    compact_every = max(25, max_iter // 20)
 
     for step in range(max_iter):
         # Cooling schedule
@@ -211,7 +332,7 @@ def simulated_annealing_for_n(n: int):
             continue
 
         # Occasionally re-anchor layout (cheap compaction)
-        if step % 200 == 0:
+        if step % compact_every == 0:
             compact_layout(current)
 
         new_cost = layout_cost(current)
@@ -246,7 +367,7 @@ def simulated_annealing_for_n(n: int):
 # ----------------------------------------------------------------------
 
 
-def sa_worker(n: int):
+def sa_worker(n: int, settings: SASettings):
     """
     Worker for ProcessPoolExecutor.
 
@@ -262,18 +383,17 @@ def sa_worker(n: int):
     best_cost = float("inf")
     best_trees: list[ChristmasTree] | None = None
 
-    for restart in range(MAX_RESTARTS):
-        # Per-(n, restart) seed for reproducibility
-        random.seed(RNG_SEED + n * 1000 + restart)
+    for restart in range(settings.max_restarts):
+        seed = RNG_SEED + settings.seed_offset + n * 1000 + restart
+        random.seed(seed)
 
-        trees, cost = simulated_annealing_for_n(n)
+        trees, cost = simulated_annealing_for_n(n, settings)
 
         if cost < best_cost:
             best_cost = cost
             best_trees = trees
 
-        # If first run already "good enough", don't waste more time
-        if restart == 0 and best_cost <= GOOD_THRESHOLD:
+        if restart == 0 and best_cost <= settings.good_threshold:
             break
 
     assert best_trees is not None
@@ -281,15 +401,83 @@ def sa_worker(n: int):
     return n, layout, best_cost
 
 
-def write_submission(layouts, path: str = "submission_sa.csv"):
+def run_sa_batch(
+    ns: list[int],
+    settings: SASettings,
+    results: dict[int, dict],
+    predicate,
+):
+    pending = [n for n in ns if predicate(n, results)]
+    if not pending:
+        console.print(
+            f"[yellow]No pending puzzles for {settings.label} SA pass.[/yellow]"
+        )
+        return
+
+    console.print(
+        f"[bold cyan]{settings.label.title()} SA pass: {len(pending)} puzzles[/bold cyan]"
+    )
+
+    executor = ProcessPoolExecutor()
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("•"),
+            TextColumn("{task.completed}/{task.total} n"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"{settings.label.title()} SA", total=len(pending))
+
+            futures = {executor.submit(sa_worker, n, settings): n for n in pending}
+
+            for fut in as_completed(futures):
+                n = futures[fut]
+                try:
+                    n_ret, layout, best_cost = fut.result()
+                except Exception as e:
+                    console.print(f"[red]Worker for n={n} failed: {e}[/red]")
+                    progress.update(task, advance=1)
+                    continue
+
+                record_result(n_ret, layout, best_cost, settings, results)
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"{settings.label.title()} SA (last n={n_ret})",
+                )
+                console.log(
+                    f"{settings.label.title()} SA finished n={n_ret:3d}, best_cost={best_cost:.6f}"
+                )
+
+    except KeyboardInterrupt:
+        console.print(
+            "\n[yellow]Ctrl+C detected. Cancelling workers for this pass...[/yellow]"
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise SystemExit(1)
+    else:
+        executor.shutdown(wait=True)
+
+
+def write_submission(results: dict[int, dict], path: str = "submission_sa.csv"):
     """
     Write Kaggle-style submission CSV from compressed layouts.
 
-    layouts: dict[int, list[(cx_str, cy_str, angle_str)]]
+    results must contain entries for every n in 1..MAX_N.
     """
+    missing = [n for n in range(1, MAX_N + 1) if n not in results]
+    if missing:
+        console.print(
+            f"[yellow]Skipping submission write; missing results for n={missing[:5]}...[/yellow]"
+        )
+        return
+
     rows = []
     for n in range(1, MAX_N + 1):
-        layout = layouts[n]
+        layout = results[n]["layout"]
         for t_idx, (cx_str, cy_str, angle_str) in enumerate(layout):
             rows.append(
                 {
@@ -310,6 +498,42 @@ def write_submission(layouts, path: str = "submission_sa.csv"):
     console.print(f"[green]Saved SA submission to [bold]{path}[/bold][/green]")
 
 
+def summarize_results(results: dict[int, dict]) -> None:
+    if not results:
+        console.print("[red]No SA results available yet.[/red]")
+        return
+
+    completed = sorted(results.keys())
+    costs = [results[n]["best_cost"] for n in completed]
+    min_cost = min(costs)
+    max_cost = max(costs)
+    med_cost = median(costs)
+    total_cost = sum(costs)
+
+    console.print(
+        f"\n[bold green]Collected SA results for {len(completed)}/{MAX_N} puzzles."
+        f" Total cost over completed set: {total_cost:.6f}[/bold green]"
+    )
+    console.print(
+        f"[cyan]Cost summary:[/cyan] min={min_cost:.6f}, median={med_cost:.6f}, max={max_cost:.6f}"
+    )
+
+    worst = sorted(results.items(), key=lambda kv: kv[1]["best_cost"], reverse=True)[
+        :10
+    ]
+    console.print("[magenta]Worst n by best_cost:[/magenta]")
+    for n, entry in worst:
+        console.print(f"  n={n:3d}, best_cost={entry['best_cost']:.6f}")
+
+    if len(completed) == MAX_N:
+        write_submission(results, "submission_sa.csv")
+    else:
+        missing = [n for n in range(1, MAX_N + 1) if n not in results]
+        console.print(
+            f"[yellow]Submission not written; still missing n={missing[:10]} (total {len(missing)}).[/yellow]"
+        )
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -317,84 +541,21 @@ def write_submission(layouts, path: str = "submission_sa.csv"):
 
 def main():
     ns = list(range(1, MAX_N + 1))
+    results = load_partial_results()
 
-    layouts: dict[int, list[tuple[str, str, str]]] = {}
-    best_costs: dict[int, float] = {}
-    total_cost = 0.0
-
-    console.print(
-        "[bold cyan]Starting SA optimization with multiprocessing...[/bold cyan]"
-    )
-
-    executor = ProcessPoolExecutor()
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TextColumn("•"),
-            TextColumn("{task.completed}/{task.total} n"),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Optimizing", total=len(ns))
-
-            futures = {executor.submit(sa_worker, n): n for n in ns}
-
-            for fut in as_completed(futures):
-                n = futures[fut]
-                try:
-                    n_ret, layout, best_cost = fut.result()
-                except Exception as e:
-                    console.print(f"[red]Worker for n={n} failed: {e}[/red]")
-                    progress.update(task, advance=1)
-                    continue
-
-                layouts[n_ret] = layout
-                best_costs[n_ret] = best_cost
-                total_cost += best_cost
-
-                progress.update(
-                    task,
-                    advance=1,
-                    description=f"Optimizing (last finished n={n_ret})",
-                )
-                console.log(f"Finished n={n_ret:3d}, best_cost={best_cost:.6f}")
-
-    except KeyboardInterrupt:
+    if results:
         console.print(
-            "\n[yellow]Ctrl+C detected. Cancelling all workers and shutting down...[/yellow]"
+            f"[bold cyan]Loaded {len(results)} existing SA results. Skipping completed n.[/bold cyan]"
         )
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise SystemExit(1)
     else:
-        executor.shutdown(wait=True)
+        console.print(
+            "[bold cyan]No partial results found. Starting fresh run.[/bold cyan]"
+        )
 
-        # Summary stats
-        if best_costs:
-            ordered = [best_costs[n] for n in sorted(best_costs)]
-            min_cost = min(ordered)
-            max_cost = max(ordered)
-            med_cost = median(ordered)
+    run_sa_batch(ns, LIGHT_SETTINGS, results, needs_light_run)
+    run_sa_batch(ns, HEAVY_SETTINGS, results, needs_heavy_run)
 
-            console.print(
-                f"\n[bold green]Approx total SA score (sum s²/n over n=1..{MAX_N}): "
-                f"{total_cost:.6f}[/bold green]"
-            )
-            console.print(
-                f"[cyan]Cost summary:[/cyan] "
-                f"min={min_cost:.6f}, median={med_cost:.6f}, max={max_cost:.6f}"
-            )
-
-            # Show a few worst offenders
-            worst = sorted(best_costs.items(), key=lambda kv: kv[1], reverse=True)[:10]
-            console.print("[magenta]Worst n by best_cost:[/magenta]")
-            for n, c in worst:
-                console.print(f"  n={n:3d}, best_cost={c:.6f}")
-        else:
-            console.print("[red]No results collected. Something went wrong.[/red]")
-
-        write_submission(layouts, "submission_sa.csv")
+    summarize_results(results)
 
 
 if __name__ == "__main__":
