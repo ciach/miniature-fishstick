@@ -17,6 +17,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from geometry import (
     ChristmasTree,
+    has_overlap,
     layout_cost,
     placed_polygons,
     scale_factor,
@@ -32,15 +33,41 @@ N_THRESHOLD_LARGE = 80
 
 STEP_XY = 0.3
 STEP_ANGLE = 10.0
+CLUSTER_ANGLE = 5.0
+CLUSTER_SIZE = 3
 
 T_START = 1.0
 T_END = 1e-3
+ACCEPT_WINDOW = 50
+ACCEPT_RATE_LOW = 0.2
+ACCEPT_RATE_HIGH = 0.65
+FAST_COOL_FACTOR = 0.85
+REHEAT_FACTOR = 1.15
 
 CENTER_MIN = Decimal("-100")
 CENTER_MAX = Decimal("100")
 
 HEAVY_RERUN_THRESHOLD = 10.0
 RESULTS_PATH = Path("sa_partial_results.json")
+GUIDED_MOVE_PROB = 0.25
+GUIDED_STEP = 0.6
+USE_PATTERN_INIT = True
+PATTERN_SPACING = 1.4
+USE_HEX_INIT = True
+HEX_SPACING_X = 1.35
+HEX_SPACING_Y = 1.15
+USE_REPULSION_INIT = True
+REPULSION_ITERS = 200
+REPULSION_STEP = 0.35
+KICK_THRESHOLD = 250
+KICK_MAGNITUDE = 1.0
+KICK_FRACTION = 0.15
+MOVE_WEIGHTS = {
+    "single": 0.6,
+    "swap": 0.2,
+    "cluster": 0.2,
+}
+SCALE = float(scale_factor)
 
 
 @dataclass(frozen=True)
@@ -72,6 +99,22 @@ HEAVY_SETTINGS = SASettings(
 )
 
 console = Console()
+
+
+def adjust_temperature(current_temp: float, acceptance_rate: float) -> float:
+    """Adaptively reheat/cool based on observed acceptance rate."""
+    updated = current_temp
+    if acceptance_rate > ACCEPT_RATE_HIGH:
+        updated *= FAST_COOL_FACTOR
+    elif acceptance_rate < ACCEPT_RATE_LOW:
+        updated *= REHEAT_FACTOR
+
+    # Clamp so we do not overshoot extremes too aggressively
+    if updated < T_END:
+        return T_END
+    if updated > T_START:
+        return T_START
+    return updated
 
 
 def load_partial_results() -> dict[int, dict]:
@@ -177,6 +220,64 @@ def random_small_delta(scale: float) -> float:
     return (random.random() * 2.0 - 1.0) * scale
 
 
+def capture_state(tree: ChristmasTree) -> tuple[Decimal, Decimal, Decimal]:
+    return (tree.center_x, tree.center_y, tree.angle)
+
+
+def restore_states(trees: list[ChristmasTree], states) -> None:
+    for idx, state in states:
+        cx, cy, angle = state
+        tree = trees[idx]
+        tree.center_x = cx
+        tree.center_y = cy
+        tree.angle = angle
+        tree.update_polygon()
+
+
+def compute_guided_move(
+    trees: list[ChristmasTree],
+    idx: int,
+    step: float = GUIDED_STEP,
+) -> tuple[float, float] | None:
+    """Return a push vector pointing away from the overlap centroid."""
+    target = trees[idx]
+    target_poly = target.polygon
+    target_cx = float(target.center_x)
+    target_cy = float(target.center_y)
+
+    for other_idx, other in enumerate(trees):
+        if other_idx == idx:
+            continue
+
+        poly = other.polygon
+        if not (target_poly.intersects(poly) and not target_poly.touches(poly)):
+            continue
+
+        inter = target_poly.intersection(poly)
+        centroid = inter.centroid
+        centroid_x = float(centroid.x) / SCALE
+        centroid_y = float(centroid.y) / SCALE
+
+        vx = target_cx - centroid_x
+        vy = target_cy - centroid_y
+
+        norm = math.hypot(vx, vy)
+        if norm < 1e-9:
+            vx = target_cx - float(other.center_x)
+            vy = target_cy - float(other.center_y)
+            norm = math.hypot(vx, vy)
+
+        if norm < 1e-9:
+            angle = random.random() * 2.0 * math.pi
+            vx = math.cos(angle)
+            vy = math.sin(angle)
+            norm = 1.0
+
+        return (vx / norm) * step, (vy / norm) * step
+
+    return None
+
+
 def greedy_initialize_single_n(num_trees: int):
     """
     Very simple greedy initializer:
@@ -273,7 +374,220 @@ def compact_layout(trees):
         t.update_polygon()
 
 
-def simulated_annealing_for_n(n: int, settings: SASettings):
+def hex_grid_initialize_single_n(num_trees: int) -> list[ChristmasTree]:
+    if num_trees <= 0:
+        return []
+
+    cols = int(math.ceil(math.sqrt(num_trees)))
+    rows = int(math.ceil(num_trees / cols))
+    trees: list[ChristmasTree] = []
+    idx = 0
+    for r in range(rows):
+        row_offset = (HEX_SPACING_X * 0.5) if (r % 2 == 1) else 0.0
+        for c in range(cols):
+            if idx >= num_trees:
+                break
+            x = (c - cols / 2) * HEX_SPACING_X + row_offset
+            y = (r - rows / 2) * HEX_SPACING_Y
+            angle = (idx * 13.0) % 360.0
+            tree = ChristmasTree(center_x=str(x), center_y=str(y), angle=str(angle))
+            trees.append(tree)
+            idx += 1
+
+    compact_layout(trees)
+    if has_overlap(trees):
+        return []
+    return trees
+
+
+def repulsion_initialize_single_n(num_trees: int) -> list[ChristmasTree]:
+    if num_trees <= 0:
+        return []
+
+    trees = []
+    for i in range(num_trees):
+        angle = (i * 31.0) % 360.0
+        trees.append(ChristmasTree(center_x="0", center_y="0", angle=str(angle)))
+
+    for _ in range(REPULSION_ITERS):
+        overlaps = 0
+        for i in range(num_trees):
+            for j in range(i + 1, num_trees):
+                t1 = trees[i]
+                t2 = trees[j]
+                if t1.polygon.intersects(t2.polygon) and not t1.polygon.touches(t2.polygon):
+                    overlaps += 1
+                    dx = float(t1.center_x - t2.center_x)
+                    dy = float(t1.center_y - t2.center_y)
+                    dist = math.hypot(dx, dy)
+                    if dist < 1e-6:
+                        angle = random.random() * 2.0 * math.pi
+                        dx = math.cos(angle)
+                        dy = math.sin(angle)
+                        dist = 1.0
+                    step = REPULSION_STEP / dist
+                    shift_x = dx * step
+                    shift_y = dy * step
+                    t1.center_x += Decimal(str(shift_x))
+                    t1.center_y += Decimal(str(shift_y))
+                    t2.center_x -= Decimal(str(shift_x))
+                    t2.center_y -= Decimal(str(shift_y))
+                    t1.update_polygon()
+                    t2.update_polygon()
+        if overlaps == 0:
+            break
+
+    compact_layout(trees)
+    if has_overlap(trees):
+        return []
+    return trees
+
+
+def pattern_initialize_single_n(num_trees: int, spacing: float = PATTERN_SPACING):
+    """Place trees along a Fermat spiral to get a compact seed layout."""
+    if num_trees <= 0:
+        return []
+
+    trees = []
+    golden_angle = math.pi * (3.0 - math.sqrt(5))
+
+    for idx in range(num_trees):
+        radius = spacing * math.sqrt(idx)
+        theta = idx * golden_angle
+        x = radius * math.cos(theta)
+        y = radius * math.sin(theta)
+        angle = (idx * 17.0) % 360.0
+        tree = ChristmasTree(center_x=str(x), center_y=str(y), angle=str(angle))
+        trees.append(tree)
+
+    compact_layout(trees)
+    if has_overlap(trees):
+        return greedy_initialize_single_n(num_trees)
+    return trees
+
+
+def choose_initial_layout(num_trees: int) -> list[ChristmasTree]:
+    initializers = []
+    if USE_HEX_INIT:
+        initializers.append(hex_grid_initialize_single_n)
+    if USE_REPULSION_INIT:
+        initializers.append(repulsion_initialize_single_n)
+    if USE_PATTERN_INIT:
+        initializers.append(pattern_initialize_single_n)
+
+    for init_fn in initializers:
+        layout = init_fn(num_trees)
+        if layout:
+            return layout
+
+    return greedy_initialize_single_n(num_trees)
+
+
+def kick_layout(trees: list[ChristmasTree]) -> None:
+    if not trees:
+        return
+
+    count = max(1, int(len(trees) * KICK_FRACTION))
+    indices = random.sample(range(len(trees)), count)
+
+    for idx in indices:
+        tree = trees[idx]
+        tree.center_x += Decimal(str(random_small_delta(KICK_MAGNITUDE)))
+        tree.center_y += Decimal(str(random_small_delta(KICK_MAGNITUDE)))
+        tree.angle += Decimal(str(random_small_delta(25.0)))
+        tree.center_x = max(CENTER_MIN, min(CENTER_MAX, tree.center_x))
+        tree.center_y = max(CENTER_MIN, min(CENTER_MAX, tree.center_y))
+        tree.update_polygon()
+
+    compact_layout(trees)
+
+
+def apply_single_move(
+    trees: list[ChristmasTree], idx: int, dx: float, dy: float, dtheta: float
+) -> list[tuple[int, tuple[Decimal, Decimal, Decimal]]] | None:
+    tree = trees[idx]
+    state = capture_state(tree)
+    tree.center_x = tree.center_x + Decimal(str(dx))
+    tree.center_y = tree.center_y + Decimal(str(dy))
+    tree.angle = tree.angle + Decimal(str(dtheta))
+
+    if (
+        tree.center_x < CENTER_MIN
+        or tree.center_x > CENTER_MAX
+        or tree.center_y < CENTER_MIN
+        or tree.center_y > CENTER_MAX
+    ):
+        tree.center_x, tree.center_y, tree.angle = state
+        tree.update_polygon()
+        return None
+
+    tree.update_polygon()
+    return [(idx, state)]
+
+
+def apply_swap_move(
+    trees: list[ChristmasTree],
+) -> list[tuple[int, tuple[Decimal, Decimal, Decimal]]] | None:
+    if len(trees) < 2:
+        return None
+
+    i, j = random.sample(range(len(trees)), 2)
+    state_i = capture_state(trees[i])
+    state_j = capture_state(trees[j])
+
+    trees[i].center_x, trees[j].center_x = trees[j].center_x, trees[i].center_x
+    trees[i].center_y, trees[j].center_y = trees[j].center_y, trees[i].center_y
+    trees[i].angle, trees[j].angle = trees[j].angle, trees[i].angle
+
+    trees[i].update_polygon()
+    trees[j].update_polygon()
+    return [(i, state_i), (j, state_j)]
+
+
+def apply_cluster_rotate_move(
+    trees: list[ChristmasTree],
+    size: int = CLUSTER_SIZE,
+    angle_scale: float = CLUSTER_ANGLE,
+) -> list[tuple[int, tuple[Decimal, Decimal, Decimal]]] | None:
+    if not trees:
+        return None
+
+    count = min(size, len(trees))
+    indices = random.sample(range(len(trees)), count)
+    centroid_x = sum(float(trees[i].center_x) for i in indices) / count
+    centroid_y = sum(float(trees[i].center_y) for i in indices) / count
+    dtheta = math.radians(random_small_delta(angle_scale))
+
+    states = []
+    for idx in indices:
+        tree = trees[idx]
+        state = capture_state(tree)
+        rel_x = float(tree.center_x) - centroid_x
+        rel_y = float(tree.center_y) - centroid_y
+        new_x = rel_x * math.cos(dtheta) - rel_y * math.sin(dtheta) + centroid_x
+        new_y = rel_x * math.sin(dtheta) + rel_y * math.cos(dtheta) + centroid_y
+        tree.center_x = Decimal(str(new_x))
+        tree.center_y = Decimal(str(new_y))
+        tree.angle = tree.angle + Decimal(str(math.degrees(dtheta)))
+
+        if (
+            tree.center_x < CENTER_MIN
+            or tree.center_x > CENTER_MAX
+            or tree.center_y < CENTER_MIN
+            or tree.center_y > CENTER_MAX
+        ):
+            restore_states(trees, states + [(idx, state)])
+            return None
+
+        tree.update_polygon()
+        states.append((idx, state))
+
+    return states
+def simulated_annealing_for_n(
+    n: int,
+    settings: SASettings,
+    initial_layout: list[ChristmasTree] | None = None,
+):
     """
     Run SA for a specific puzzle size n using the provided settings.
 
@@ -282,7 +596,10 @@ def simulated_annealing_for_n(n: int, settings: SASettings):
         best_cost: float
     """
     # Initial layout
-    current = greedy_initialize_single_n(n)
+    if initial_layout is not None:
+        current = [deepcopy(t) for t in initial_layout]
+    else:
+        current = choose_initial_layout(n)
     compact_layout(current)
 
     current_cost = layout_cost(current)
@@ -291,44 +608,38 @@ def simulated_annealing_for_n(n: int, settings: SASettings):
 
     max_iter = settings.iter_small if n < N_THRESHOLD_LARGE else settings.iter_large
     compact_every = max(25, max_iter // 20)
+    temperature = T_START
+    cooling_multiplier = (T_END / T_START) ** (1 / max(1, max_iter))
+    recent_accepts = 0
+    recent_attempts = 0
+    since_improvement = 0
+    move_types = list(MOVE_WEIGHTS.keys())
+    move_weights = list(MOVE_WEIGHTS.values())
 
     for step in range(max_iter):
-        # Cooling schedule
-        alpha = step / max(1, max_iter - 1)  # 0 -> 1
-        T = T_START * (T_END / T_START) ** alpha
+        scale = max(0.1, min(1.0, temperature / T_START))
+        move_type = random.choices(move_types, weights=move_weights, k=1)[0]
+        move_states = None
 
-        # Adaptive step sizes: big moves early, small moves late
-        scale = max(0.1, 1.0 - alpha)
-        dx = random_small_delta(STEP_XY * scale)
-        dy = random_small_delta(STEP_XY * scale)
-        dtheta = random_small_delta(STEP_ANGLE * scale)
+        if move_type == "single":
+            dx = random_small_delta(STEP_XY * scale)
+            dy = random_small_delta(STEP_XY * scale)
+            dtheta = random_small_delta(STEP_ANGLE * scale)
+            idx = random.randrange(len(current))
 
-        idx = random.randrange(len(current))
-        tree = current[idx]
+            if random.random() < GUIDED_MOVE_PROB:
+                guided_vector = compute_guided_move(current, idx)
+                if guided_vector is not None:
+                    dx, dy = guided_vector
+                    dtheta = 0.0
 
-        # Save old state
-        old_cx = tree.center_x
-        old_cy = tree.center_y
-        old_angle = tree.angle
+            move_states = apply_single_move(current, idx, dx, dy, dtheta)
+        elif move_type == "swap":
+            move_states = apply_swap_move(current)
+        elif move_type == "cluster":
+            move_states = apply_cluster_rotate_move(current)
 
-        # Propose move
-        tree.center_x = tree.center_x + Decimal(str(dx))
-        tree.center_y = tree.center_y + Decimal(str(dy))
-        tree.angle = tree.angle + Decimal(str(dtheta))
-        tree.update_polygon()
-
-        # Hard constraints: centers must stay in [-100, 100]
-        if (
-            tree.center_x < CENTER_MIN
-            or tree.center_x > CENTER_MAX
-            or tree.center_y < CENTER_MIN
-            or tree.center_y > CENTER_MAX
-        ):
-            # reject immediately
-            tree.center_x = old_cx
-            tree.center_y = old_cy
-            tree.angle = old_angle
-            tree.update_polygon()
+        if move_states is None:
             continue
 
         # Occasionally re-anchor layout (cheap compaction)
@@ -342,8 +653,8 @@ def simulated_annealing_for_n(n: int, settings: SASettings):
         if delta <= 0:
             accept = True
         else:
-            if T > 0:
-                prob = math.exp(-delta / T)
+            if temperature > 0:
+                prob = math.exp(-delta / temperature)
                 if random.random() < prob:
                     accept = True
 
@@ -352,12 +663,28 @@ def simulated_annealing_for_n(n: int, settings: SASettings):
             if new_cost < best_cost:
                 best_cost = new_cost
                 best = deepcopy(current)
+                since_improvement = 0
+            else:
+                since_improvement += 1
+            recent_accepts += 1
         else:
-            # revert to old state
-            tree.center_x = old_cx
-            tree.center_y = old_cy
-            tree.angle = old_angle
-            tree.update_polygon()
+            restore_states(current, move_states)
+            since_improvement += 1
+
+        recent_attempts += 1
+
+        if (step + 1) % ACCEPT_WINDOW == 0:
+            rate = recent_accepts / max(1, recent_attempts)
+            temperature = adjust_temperature(temperature, rate)
+            recent_accepts = 0
+            recent_attempts = 0
+
+        temperature = max(T_END, temperature * cooling_multiplier)
+
+        if since_improvement >= KICK_THRESHOLD:
+            kick_layout(current)
+            current_cost = layout_cost(current)
+            since_improvement = 0
 
     return best, best_cost
 
